@@ -40,4 +40,11 @@ struct NetBasal {
             }
         }
     }
+
+    init(suspendedAt: Date, scheduledBasal: AbsoluteScheduleValue<Double>) {
+        rate = 0 - scheduledBasal.value
+        percent = rate / scheduledBasal.value
+        start = suspendedAt
+        end = suspendedAt
+    }
 }

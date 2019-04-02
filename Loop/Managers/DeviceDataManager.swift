@@ -155,6 +155,7 @@ final class DeviceDataManager {
         statusExtensionManager = StatusExtensionDataManager(deviceDataManager: self)
         loopManager = LoopDataManager(
             lastLoopCompleted: statusExtensionManager.context?.lastLoopCompleted,
+            // TODO: This ends up creating a "double relative" rate. PumpManager should be source of truth for this across restarts.
             lastTempBasal: statusExtensionManager.context?.netBasal?.tempBasal
         )
         watchManager = WatchDataManager(deviceManager: self)

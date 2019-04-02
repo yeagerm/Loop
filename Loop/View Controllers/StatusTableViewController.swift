@@ -178,7 +178,6 @@ final class StatusTableViewController: ChartsTableViewController {
                     self.bolusProgressReporter = self.deviceManager.pumpManager?.createBolusProgressReporter(reportingOn: DispatchQueue.main)
                 }
                 refreshContext.update(with: .status)
-                self.reloadData(animated: true)
             }
         }
     }
@@ -300,11 +299,16 @@ final class StatusTableViewController: ChartsTableViewController {
             // Net basal rate HUD
             let date = state.lastTempBasal?.startDate ?? Date()
             if let scheduledBasal = manager.basalRateSchedule?.between(start: date, end: date).first {
-                netBasal = NetBasal(
-                    lastTempBasal: state.lastTempBasal,
-                    maxBasal: manager.settings.maximumBasalRatePerHour,
-                    scheduledBasal: scheduledBasal
-                )
+                switch self.basalDeliveryState {
+                case .suspended, .resuming:
+                    netBasal = NetBasal(suspendedAt: date, scheduledBasal: scheduledBasal)
+                default:
+                    netBasal = NetBasal(
+                        lastTempBasal: state.lastTempBasal,
+                        maxBasal: manager.settings.maximumBasalRatePerHour,
+                        scheduledBasal: scheduledBasal
+                    )
+                }
             } else {
                 netBasal = nil
             }
@@ -1212,8 +1216,12 @@ extension StatusTableViewController: CompletionDelegate {
 extension StatusTableViewController: PumpManagerStatusObserver {
     func pumpManager(_ pumpManager: PumpManager, didUpdate status: PumpManagerStatus) {
         DispatchQueue.main.async {
+            let deliveryChanged = status.basalDeliveryState != self.basalDeliveryState || status.bolusState != self.bolusState
             self.basalDeliveryState = status.basalDeliveryState
             self.bolusState = status.bolusState
+            if deliveryChanged {
+                self.reloadData(animated: true)
+            }
         }
     }
 }
