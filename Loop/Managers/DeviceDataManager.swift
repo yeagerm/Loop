@@ -27,6 +27,8 @@ final class DeviceDataManager {
 
     private var nightscoutDataManager: NightscoutDataManager!
 
+    private(set) var testingScenariosManager: TestingScenariosManager?
+
     /// The last error recorded by a device manager
     /// Should be accessed only on the main queue
     private(set) var lastError: (date: Date, error: Error)?
@@ -40,6 +42,8 @@ final class DeviceDataManager {
             UserDefaults.appGroup?.cgmManager = cgmManager
         }
     }
+
+    private var lastBLEDrivenUpdate = Date.distantPast
 
     // MARK: - Pump
 
@@ -92,6 +96,10 @@ final class DeviceDataManager {
         watchManager = WatchDataManager(deviceManager: self)
         nightscoutDataManager = NightscoutDataManager(deviceDataManager: self)
 
+        if debugEnabled {
+            testingScenariosManager = LocalTestingScenariosManager(deviceManager: self)
+        }
+
         loopManager.delegate = self
         loopManager.carbStore.syncDelegate = remoteDataManager.nightscoutService.uploader
         loopManager.doseStore.delegate = self
@@ -136,14 +144,16 @@ private extension DeviceDataManager {
 
 // MARK: - Client API
 extension DeviceDataManager {
-    func enactBolus(units: Double, at startDate: Date = Date(), completion: @escaping (_ error: Error?) -> Void) {
+    func enactBolus(units: Double, at startDate: Date = Date(), willRequest: ((DoseEntry) -> Void)? = nil, completion: @escaping (_ error: Error?) -> Void) {
         guard let pumpManager = pumpManager else {
             completion(LoopError.configurationError(.pumpManager))
             return
         }
 
         pumpManager.enactBolus(units: units, at: startDate, willRequest: { (dose) in
-            self.loopManager.addRequestedBolus(dose, completion: nil)
+            self.loopManager.addRequestedBolus(dose, completion: {
+                willRequest?(dose)
+            })
         }) { (result) in
             switch result {
             case .failure(let error):
@@ -190,11 +200,15 @@ extension DeviceDataManager: DeviceManagerDelegate {
             trigger: trigger
         )
 
-        UNUserNotificationCenter.current().add(request)
+        DispatchQueue.main.async {
+            UNUserNotificationCenter.current().add(request)
+        }
     }
 
     func clearNotification(for manager: DeviceManager, identifier: String) {
-        UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [identifier])
+        DispatchQueue.main.async {
+            UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [identifier])
+        }
     }
 }
 
@@ -270,6 +284,13 @@ extension DeviceDataManager: PumpManagerDelegate {
     func pumpManagerBLEHeartbeatDidFire(_ pumpManager: PumpManager) {
         dispatchPrecondition(condition: .onQueue(queue))
         log.default("PumpManager:\(type(of: pumpManager)) did fire BLE heartbeat")
+
+        let bleHeartbeatUpdateInterval = TimeInterval(minutes: 4.5)
+        guard lastBLEDrivenUpdate.timeIntervalSinceNow < -bleHeartbeatUpdateInterval else {
+            log.default("Skipping ble heartbeat")
+            return
+        }
+        lastBLEDrivenUpdate = Date()
 
         cgmManager?.fetchNewDataIfNeeded { (result) in
             if case .newData = result {
@@ -434,38 +455,44 @@ extension DeviceDataManager: DoseStoreDelegate {
 
 // MARK: - TestingPumpManager
 extension DeviceDataManager {
-    func deleteTestingPumpData() {
-        assertingDebugOnly {
-            guard let testingPumpManager = pumpManager as? TestingPumpManager else {
-                assertionFailure("\(#function) should be invoked only when a testing pump manager is in use")
+    func deleteTestingPumpData(completion: ((Error?) -> Void)? = nil) {
+        assertDebugOnly()
+
+        guard let testingPumpManager = pumpManager as? TestingPumpManager else {
+            assertionFailure("\(#function) should be invoked only when a testing pump manager is in use")
+            return
+        }
+
+        let devicePredicate = HKQuery.predicateForObjects(from: [testingPumpManager.testingDevice])
+        let doseStore = loopManager.doseStore
+        let insulinDeliveryStore = doseStore.insulinDeliveryStore
+        let healthStore = insulinDeliveryStore.healthStore
+        doseStore.resetPumpData { doseStoreError in
+            guard doseStoreError == nil else {
+                completion?(doseStoreError!)
                 return
             }
-            let devicePredicate = HKQuery.predicateForObjects(from: [testingPumpManager.testingDevice])
 
-            // DoseStore.deleteAllPumpEvents first syncs the events to the health store,
-            // so HKHealthStore.deleteObjects catches any that were still in the cache.
-            let doseStore = loopManager.doseStore
-            let healthStore = doseStore.insulinDeliveryStore.healthStore
-            doseStore.deleteAllPumpEvents { doseStoreError in
-                if doseStoreError != nil {
-                    healthStore.deleteObjects(of: doseStore.sampleType!, predicate: devicePredicate) { success, deletedObjectCount, error in
-                        // errors are already logged through the store, so we'll ignore them here
-                    }
+            healthStore.deleteObjects(of: doseStore.sampleType!, predicate: devicePredicate) { success, deletedObjectCount, error in
+                if success {
+                    insulinDeliveryStore.test_lastBasalEndDate = nil
                 }
+                completion?(error)
             }
         }
     }
 
-    func deleteTestingCGMData() {
-        assertingDebugOnly {
-            guard let testingCGMManager = cgmManager as? TestingCGMManager else {
-                assertionFailure("\(#function) should be invoked only when a testing CGM manager is in use")
-                return
-            }
-            let predicate = HKQuery.predicateForObjects(from: [testingCGMManager.testingDevice])
-            loopManager.glucoseStore.purgeGlucoseSamples(matchingCachePredicate: nil, healthKitPredicate: predicate) { success, count, error in
-                // result already logged through the store, so ignore the error here
-            }
+    func deleteTestingCGMData(completion: ((Error?) -> Void)? = nil) {
+        assertDebugOnly()
+
+        guard let testingCGMManager = cgmManager as? TestingCGMManager else {
+            assertionFailure("\(#function) should be invoked only when a testing CGM manager is in use")
+            return
+        }
+
+        let predicate = HKQuery.predicateForObjects(from: [testingCGMManager.testingDevice])
+        loopManager.glucoseStore.purgeGlucoseSamples(matchingCachePredicate: nil, healthKitPredicate: predicate) { success, count, error in
+            completion?(error)
         }
     }
 }

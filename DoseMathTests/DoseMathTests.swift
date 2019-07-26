@@ -57,7 +57,7 @@ class RecommendTempBasalTests: XCTestCase {
 
     fileprivate let fortyIncrementsPerUnitRounder = { round($0 * 40) / 40 }
 
-    func loadGlucoseValueFixture(_ resourceName: String) -> [GlucoseValue] {
+    func loadGlucoseValueFixture(_ resourceName: String) -> [GlucoseFixtureValue] {
         let fixture: [JSONDictionary] = loadFixture(resourceName)
         let dateFormatter = ISO8601DateFormatter.localTimeDateFormatter()
 
@@ -84,7 +84,7 @@ class RecommendTempBasalTests: XCTestCase {
     }
 
     var glucoseTargetRange: GlucoseRangeSchedule {
-        return GlucoseRangeSchedule(unit: HKUnit.milligramsPerDeciliter, dailyItems: [RepeatingScheduleValue(startTime: TimeInterval(0), value: DoubleRange(minValue: 90, maxValue: 120))], overrideRanges: [:])!
+        return GlucoseRangeSchedule(unit: HKUnit.milligramsPerDeciliter, dailyItems: [RepeatingScheduleValue(startTime: TimeInterval(0), value: DoubleRange(minValue: 90, maxValue: 120))])!
     }
 
     var insulinSensitivitySchedule: InsulinSensitivitySchedule {
@@ -118,6 +118,25 @@ class RecommendTempBasalTests: XCTestCase {
         )
 
         XCTAssertNil(dose)
+    }
+
+    func testNoChangeOverrideActive() {
+        let glucose = loadGlucoseValueFixture("recommend_temp_basal_no_change_glucose")
+
+        let dose = glucose.recommendedTempBasal(
+            to: glucoseTargetRange,
+            at: glucose.first!.startDate,
+            suspendThreshold: suspendThreshold.quantity,
+            sensitivity: insulinSensitivitySchedule,
+            model: insulinModel,
+            basalRates: basalRateSchedule,
+            maxBasalRate: maxBasalRate,
+            lastTempBasal: nil,
+            isBasalRateScheduleOverrideActive: true
+        )
+
+        XCTAssertEqual(0.8, dose!.unitsPerHour, accuracy: 1.0 / 40.0)
+        XCTAssertEqual(TimeInterval(minutes: 30), dose!.duration)
     }
 
     func testStartHighEndInRange() {
@@ -422,7 +441,7 @@ class RecommendTempBasalTests: XCTestCase {
 
 
     func testNoInputGlucose() {
-        let glucose: [GlucoseValue] = []
+        let glucose: [GlucoseFixtureValue] = []
 
         let dose = glucose.recommendedTempBasal(
             to: glucoseTargetRange,
@@ -445,7 +464,7 @@ class RecommendBolusTests: XCTestCase {
 
     fileprivate let fortyIncrementsPerUnitRounder = { round($0 * 40) / 40 }
 
-    func loadGlucoseValueFixture(_ resourceName: String) -> [GlucoseValue] {
+    func loadGlucoseValueFixture(_ resourceName: String) -> [GlucoseFixtureValue] {
         let fixture: [JSONDictionary] = loadFixture(resourceName)
         let dateFormatter = ISO8601DateFormatter.localTimeDateFormatter()
 
@@ -472,7 +491,7 @@ class RecommendBolusTests: XCTestCase {
     }
 
     var glucoseTargetRange: GlucoseRangeSchedule {
-        return GlucoseRangeSchedule(unit: HKUnit.milligramsPerDeciliter, dailyItems: [RepeatingScheduleValue(startTime: TimeInterval(0), value: DoubleRange(minValue: 90, maxValue: 120))], overrideRanges: [:])!
+        return GlucoseRangeSchedule(unit: HKUnit.milligramsPerDeciliter, dailyItems: [RepeatingScheduleValue(startTime: TimeInterval(0), value: DoubleRange(minValue: 90, maxValue: 120))])!
     }
 
     var insulinSensitivitySchedule: InsulinSensitivitySchedule {
@@ -804,7 +823,7 @@ class RecommendBolusTests: XCTestCase {
 
 
     func testNoInputGlucose() {
-        let glucose: [GlucoseValue] = []
+        let glucose: [GlucoseFixtureValue] = []
 
         let dose = glucose.recommendedBolus(
             to: glucoseTargetRange,

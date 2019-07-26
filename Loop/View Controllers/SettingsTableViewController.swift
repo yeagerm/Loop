@@ -21,7 +21,7 @@ final class SettingsTableViewController: UITableViewController {
     override func viewDidLoad() {
         super.viewDidLoad()
 
-        tableView.rowHeight = UITableViewAutomaticDimension
+        tableView.rowHeight = UITableView.automaticDimension
         tableView.estimatedRowHeight = 44
 
         tableView.register(SettingsTableViewCell.self, forCellReuseIdentifier: SettingsTableViewCell.className)
@@ -82,6 +82,7 @@ final class SettingsTableViewController: UITableViewController {
         case insulinModel
         case carbRatio
         case insulinSensitivity
+        case overridePresets
     }
 
     fileprivate enum ServiceRow: Int, CaseCountable {
@@ -152,7 +153,11 @@ final class SettingsTableViewController: UITableViewController {
         case .cgm:
             return CGMRow.count
         case .configuration:
-            return ConfigurationRow.count
+            if FeatureFlags.sensitivityOverridesEnabled {
+                return ConfigurationRow.count
+            } else {
+                return ConfigurationRow.count - 1
+            }
         case .services:
             return ServiceRow.count
         case .testingPumpDataDeletion, .testingCGMDataDeletion:
@@ -234,10 +239,13 @@ final class SettingsTableViewController: UITableViewController {
 
                 if let insulinSensitivitySchedule = dataManager.loopManager.insulinSensitivitySchedule {
                     let unit = insulinSensitivitySchedule.unit
-                    let value = valueNumberFormatter.string(from: insulinSensitivitySchedule.averageQuantity().doubleValue(for: unit)) ?? SettingsTableViewCell.NoValueString
-
-                    configCell.detailTextLabel?.text = String(format: NSLocalizedString("%1$@ %2$@/U", comment: "Format string for insulin sensitivity average (1: value)(2: glucose unit)"), value, unit.localizedShortUnitString
-                    )
+                    // Schedule is in mg/dL or mmol/L, but we display as mg/dL/U or mmol/L/U
+                    let average = insulinSensitivitySchedule.averageQuantity().doubleValue(for: unit)
+                    let unitPerU = unit.unitDivided(by: .internationalUnit())
+                    let averageQuantity = HKQuantity(unit: unitPerU, doubleValue: average)
+                    let formatter = QuantityFormatter()
+                    formatter.setPreferredNumberFormatter(for: unit)
+                    configCell.detailTextLabel?.text = formatter.string(from: averageQuantity, for: unitPerU)
                 } else {
                     configCell.detailTextLabel?.text = SettingsTableViewCell.TapToSetString
                 }
@@ -287,6 +295,14 @@ final class SettingsTableViewController: UITableViewController {
                 } else {
                     configCell.detailTextLabel?.text = SettingsTableViewCell.TapToSetString
                 }
+            case .overridePresets:
+                configCell.textLabel?.text = NSLocalizedString("Override Presets", comment: "The title text for the override presets")
+                let maxPreviewSymbolCount = 3
+                let presetPreviewText = dataManager.loopManager.settings.overridePresets
+                    .prefix(maxPreviewSymbolCount)
+                    .map { $0.symbol }
+                    .joined(separator: " ")
+                configCell.detailTextLabel?.text = presetPreviewText
             }
 
             configCell.accessoryType = .disclosureIndicator
@@ -457,50 +473,37 @@ final class SettingsTableViewController: UITableViewController {
 
                 show(scheduleVC, sender: sender)
             case .insulinSensitivity:
-                let scheduleVC = DailyQuantityScheduleTableViewController()
+                let unit = dataManager.loopManager.insulinSensitivitySchedule?.unit ?? dataManager.loopManager.glucoseStore.preferredUnit ?? HKUnit.milligramsPerDeciliter
+                let allowedSensitivityValues = dataManager.loopManager.settings.allowedSensitivityValues(for: unit)
+                let scheduleVC = InsulinSensitivityScheduleViewController(allowedValues: allowedSensitivityValues, unit: unit)
 
                 scheduleVC.delegate = self
+                scheduleVC.insulinSensitivityScheduleStorageDelegate = self
                 scheduleVC.title = NSLocalizedString("Insulin Sensitivities", comment: "The title of the insulin sensitivities schedule screen")
 
-                if let schedule = dataManager.loopManager.insulinSensitivitySchedule {
-                    scheduleVC.timeZone = schedule.timeZone
-                    scheduleVC.scheduleItems = schedule.items
-                    scheduleVC.unit = schedule.unit
+                scheduleVC.schedule = dataManager.loopManager.insulinSensitivitySchedule
 
-                    show(scheduleVC, sender: sender)
-                } else {
-                    if let timeZone = dataManager.pumpManager?.status.timeZone {
-                        scheduleVC.timeZone = timeZone
-                    }
-
-                    if let unit = dataManager.loopManager.glucoseStore.preferredUnit {
-                        scheduleVC.unit = unit
-                        self.show(scheduleVC, sender: sender)
-                    }
-                }
+                show(scheduleVC, sender: sender)
             case .glucoseTargetRange:
-                let scheduleVC = GlucoseRangeScheduleTableViewController()
+                let unit = dataManager.loopManager.settings.glucoseTargetRangeSchedule?.unit ?? dataManager.loopManager.glucoseStore.preferredUnit ?? HKUnit.milligramsPerDeciliter
+                let allowedCorrectionRangeValues = dataManager.loopManager.settings.allowedCorrectionRangeValues(for: unit)
+                let scheduleVC = GlucoseRangeScheduleTableViewController(allowedValues: allowedCorrectionRangeValues, unit: unit)
+
+                if FeatureFlags.sensitivityOverridesEnabled {
+                    scheduleVC.overrideContexts.remove(.legacyWorkout)
+                }
 
                 scheduleVC.delegate = self
                 scheduleVC.title = NSLocalizedString("Correction Range", comment: "The title of the glucose target range schedule screen")
 
                 if let schedule = dataManager.loopManager.settings.glucoseTargetRangeSchedule {
-                    scheduleVC.timeZone = schedule.timeZone
-                    scheduleVC.scheduleItems = schedule.items
-                    scheduleVC.unit = schedule.unit
-                    scheduleVC.overrideRanges = schedule.overrideRanges
-
-                    show(scheduleVC, sender: sender)
-                } else {
-                    if let timeZone = dataManager.pumpManager?.status.timeZone {
-                        scheduleVC.timeZone = timeZone
-                    }
-
-                    if let unit = dataManager.loopManager.glucoseStore.preferredUnit {
-                        scheduleVC.unit = unit
-                        self.show(scheduleVC, sender: sender)
-                    }
+                    var overrides: [TemporaryScheduleOverride.Context: DoubleRange] = [:]
+                    overrides[.preMeal] = dataManager.loopManager.settings.preMealTargetRange.filter { !$0.isZero }
+                    overrides[.legacyWorkout] = dataManager.loopManager.settings.legacyWorkoutTargetRange.filter { !$0.isZero }
+                    scheduleVC.setSchedule(schedule, withOverrideRanges: overrides)
                 }
+
+                show(scheduleVC, sender: sender)
             case .suspendThreshold:
                 if let minBGGuard = dataManager.loopManager.settings.suspendThreshold {
                     let vc = GlucoseThresholdTableViewController(threshold: minBGGuard.value, glucoseUnit: minBGGuard.unit)
@@ -548,6 +551,15 @@ final class SettingsTableViewController: UITableViewController {
                 vc.syncSource = pumpManager
 
                 show(vc, sender: sender)
+            case .overridePresets:
+                guard let glucoseUnit = dataManager.loopManager.glucoseStore.preferredUnit else { break }
+                let vc = OverridePresetTableViewController(
+                    glucoseUnit: glucoseUnit,
+                    presets: dataManager.loopManager.settings.overridePresets
+                )
+                vc.delegate = self
+
+                show(vc, sender: sender)
             }
         case .loop:
             switch LoopRow(rawValue: indexPath.row)! {
@@ -593,12 +605,12 @@ final class SettingsTableViewController: UITableViewController {
                 show(vc, sender: sender)
             }
         case .testingPumpDataDeletion:
-            let confirmVC = UIAlertController(pumpDataDeletionHandler: dataManager.deleteTestingPumpData)
+            let confirmVC = UIAlertController(pumpDataDeletionHandler: { self.dataManager.deleteTestingPumpData() })
             present(confirmVC, animated: true) {
                 tableView.deselectRow(at: indexPath, animated: true)
             }
         case .testingCGMDataDeletion:
-            let confirmVC = UIAlertController(cgmDataDeletionHandler: dataManager.deleteTestingCGMData)
+            let confirmVC = UIAlertController(cgmDataDeletionHandler: { self.dataManager.deleteTestingCGMData() })
             present(confirmVC, animated: true) {
                 tableView.deselectRow(at: indexPath, animated: true)
             }
@@ -610,11 +622,11 @@ final class SettingsTableViewController: UITableViewController {
         case .loop:
             break
         case .pump:
-            let previousTestingPumpDataDeletionSection = sections.index(of: .testingPumpDataDeletion)
+            let previousTestingPumpDataDeletionSection = sections.firstIndex(of: .testingPumpDataDeletion)
             let wasTestingPumpManager = isTestingPumpManager
             isTestingPumpManager = dataManager.pumpManager is TestingPumpManager
             if !wasTestingPumpManager, isTestingPumpManager {
-                guard let testingPumpDataDeletionSection = sections.index(of: .testingPumpDataDeletion) else {
+                guard let testingPumpDataDeletionSection = sections.firstIndex(of: .testingPumpDataDeletion) else {
                     fatalError("Expected to find testing pump data deletion section with testing pump in use")
                 }
                 tableView.insertSections([testingPumpDataDeletionSection], with: .automatic)
@@ -627,11 +639,11 @@ final class SettingsTableViewController: UITableViewController {
             tableView.reloadSections([Section.pump.rawValue], with: .fade)
             tableView.reloadSections([Section.cgm.rawValue], with: .fade)
         case .cgm:
-            let previousTestingCGMDataDeletionSection = sections.index(of: .testingCGMDataDeletion)
+            let previousTestingCGMDataDeletionSection = sections.firstIndex(of: .testingCGMDataDeletion)
             let wasTestingCGMManager = isTestingCGMManager
             isTestingCGMManager = dataManager.cgmManager is TestingCGMManager
             if !wasTestingCGMManager, isTestingCGMManager {
-                guard let testingCGMDataDeletionSection = sections.index(of: .testingCGMDataDeletion) else {
+                guard let testingCGMDataDeletionSection = sections.firstIndex(of: .testingCGMDataDeletion) else {
                     fatalError("Expected to find testing CGM data deletion section with testing CGM in use")
                 }
                 tableView.insertSections([testingCGMDataDeletionSection], with: .automatic)
@@ -724,10 +736,6 @@ extension SettingsTableViewController: DailyValueScheduleTableViewControllerDele
         switch sections[indexPath.section] {
         case .configuration:
             switch ConfigurationRow(rawValue: indexPath.row)! {
-            case .glucoseTargetRange:
-                if let controller = controller as? GlucoseRangeScheduleTableViewController {
-                    dataManager.loopManager.settings.glucoseTargetRangeSchedule = GlucoseRangeSchedule(unit: controller.unit, dailyItems: controller.scheduleItems, timeZone: controller.timeZone, overrideRanges: controller.overrideRanges, override: dataManager.loopManager.settings.glucoseTargetRangeSchedule?.override)
-                }
             case .basalRate:
                 if let controller = controller as? BasalScheduleTableViewController {
                     dataManager.loopManager.basalRateSchedule = BasalRateSchedule(dailyItems: controller.scheduleItems, timeZone: controller.timeZone)
@@ -738,9 +746,6 @@ extension SettingsTableViewController: DailyValueScheduleTableViewControllerDele
                     case .carbRatio:
                         dataManager.loopManager.carbRatioSchedule = CarbRatioSchedule(unit: controller.unit, dailyItems: controller.scheduleItems, timeZone: controller.timeZone)
                         AnalyticsManager.shared.didChangeCarbRatioSchedule()
-                    case .insulinSensitivity:
-                        dataManager.loopManager.insulinSensitivitySchedule = InsulinSensitivitySchedule(unit: controller.unit, dailyItems: controller.scheduleItems, timeZone: controller.timeZone)
-                        AnalyticsManager.shared.didChangeInsulinSensitivitySchedule()
                     default:
                         break
                     }
@@ -754,6 +759,24 @@ extension SettingsTableViewController: DailyValueScheduleTableViewControllerDele
     }
 }
 
+extension SettingsTableViewController: GlucoseRangeScheduleStorageDelegate {
+    func saveSchedule(for viewController: GlucoseRangeScheduleTableViewController, completion: @escaping (SaveGlucoseRangeScheduleResult) -> Void) {
+        dataManager.loopManager.settings.preMealTargetRange = viewController.overrideRanges[.preMeal].filter { !$0.isZero }
+        dataManager.loopManager.settings.legacyWorkoutTargetRange = viewController.overrideRanges[.legacyWorkout].filter { !$0.isZero }
+        dataManager.loopManager.settings.glucoseTargetRangeSchedule = viewController.schedule
+        completion(.success)
+        tableView.reloadRows(at: [IndexPath(row: ConfigurationRow.glucoseTargetRange.rawValue, section: Section.configuration.rawValue)], with: .none)
+    }
+}
+
+extension SettingsTableViewController: InsulinSensitivityScheduleStorageDelegate {
+    func saveSchedule(_ schedule: InsulinSensitivitySchedule, for viewController: InsulinSensitivityScheduleViewController, completion: @escaping (SaveInsulinSensitivityScheduleResult) -> Void) {
+        dataManager.loopManager.insulinSensitivitySchedule = schedule
+        AnalyticsManager.shared.didChangeInsulinSensitivitySchedule()
+        completion(.success)
+        tableView.reloadRows(at: [IndexPath(row: ConfigurationRow.insulinSensitivity.rawValue, section: Section.configuration.rawValue)], with: .none)
+    }
+}
 
 extension SettingsTableViewController: InsulinModelSettingsViewControllerDelegate {
     func insulinModelSettingsViewControllerDidChangeValue(_ controller: InsulinModelSettingsViewController) {
@@ -823,6 +846,16 @@ extension SettingsTableViewController: DeliveryLimitSettingsTableViewControllerD
         tableView.reloadRows(at: [[Section.configuration.rawValue, ConfigurationRow.deliveryLimits.rawValue]], with: .none)
     }
 }
+
+
+extension SettingsTableViewController: OverridePresetTableViewControllerDelegate {
+    func overridePresetTableViewControllerDidUpdatePresets(_ vc: OverridePresetTableViewController) {
+        dataManager.loopManager.settings.overridePresets = vc.presets
+
+        tableView.reloadRows(at: [[Section.configuration.rawValue, ConfigurationRow.overridePresets.rawValue]], with: .none)
+    }
+}
+
 
 private extension UIAlertController {
     convenience init(pumpDataDeletionHandler handler: @escaping () -> Void) {

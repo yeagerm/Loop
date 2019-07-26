@@ -98,9 +98,7 @@ final class WatchDataManager: NSObject {
         }
 
         createWatchContext { (context) in
-            if let context = context {
-                self.sendWatchContext(context)
-            }
+            self.sendWatchContext(context)
         }
     }
 
@@ -142,7 +140,7 @@ final class WatchDataManager: NSObject {
         }
     }
 
-    private func createWatchContext(_ completion: @escaping (_ context: WatchContext?) -> Void) {
+    private func createWatchContext(_ completion: @escaping (_ context: WatchContext) -> Void) {
         let loopManager = deviceManager.loopManager!
 
         let glucose = loopManager.glucoseStore.latestGlucose
@@ -176,10 +174,10 @@ final class WatchDataManager: NSObject {
 
             // Only set this value in the Watch context if there is a temp basal running that hasn't ended yet
             let date = state.lastTempBasal?.startDate ?? Date()
-            if let scheduledBasal = manager.basalRateSchedule?.between(start: date, end: date).first,
+            if let scheduledBasal = manager.basalRateScheduleApplyingOverrideHistory?.between(start: date, end: date).first,
                 let lastTempBasal = state.lastTempBasal,
                 lastTempBasal.endDate > Date() {
-                context.lastNetTempBasalDose =  lastTempBasal.unitsPerHour - scheduledBasal.value
+                context.lastNetTempBasalDose = lastTempBasal.unitsPerHour - scheduledBasal.value
             }
 
             // Drop the first element in predictedGlucose because it is the current glucose
@@ -192,19 +190,20 @@ final class WatchDataManager: NSObject {
         }
     }
 
-    private func addCarbEntryFromWatchMessage(_ message: [String: Any], completionHandler: ((_ units: Double?) -> Void)? = nil) {
+    private func addCarbEntryFromWatchMessage(_ message: [String: Any], completionHandler: ((_ error: Error?) -> Void)? = nil) {
         if let carbEntry = CarbEntryUserInfo(rawValue: message)?.carbEntry {
             deviceManager.loopManager.addCarbEntryAndRecommendBolus(carbEntry) { (result) in
                 switch result {
-                case .success(let recommendation):
+                case .success:
                     AnalyticsManager.shared.didAddCarbsFromWatch()
-                    completionHandler?(recommendation?.amount)
+                    completionHandler?(nil)
                 case .failure(let error):
                     self.log.error(error)
-                    completionHandler?(nil)
+                    completionHandler?(error)
                 }
             }
         } else {
+            log.error("Could not add carb entry from unknown message: \(message)")
             completionHandler?(nil)
         }
     }
@@ -215,30 +214,42 @@ extension WatchDataManager: WCSessionDelegate {
     func session(_ session: WCSession, didReceiveMessage message: [String: Any], replyHandler: @escaping ([String: Any]) -> Void) {
         switch message["name"] as? String {
         case CarbEntryUserInfo.name?:
-            addCarbEntryFromWatchMessage(message) { (units) in
-                replyHandler(BolusSuggestionUserInfo(recommendedBolus: units ?? 0, maxBolus: self.deviceManager.loopManager.settings.maximumBolus).rawValue)
+            addCarbEntryFromWatchMessage(message) { (_) in
+                self.createWatchContext { (context) in
+                    // Send back the updated prediction and recommended bolus
+                    replyHandler(context.rawValue)
+                }
             }
         case SetBolusUserInfo.name?:
+            // Start the bolus and reply when it's successfully requested
             if let bolus = SetBolusUserInfo(rawValue: message as SetBolusUserInfo.RawValue) {
                 self.deviceManager.enactBolus(units: bolus.value, at: bolus.startDate) { (error) in
                     if error == nil {
                         AnalyticsManager.shared.didSetBolusFromWatch(bolus.value)
                     }
+
+                    // When we've successfully started the bolus, send a new context with our new prediction
+                    self.sendWatchContextIfNeeded()
                 }
             }
 
+            // Reply immediately
             replyHandler([:])
         case LoopSettingsUserInfo.name?:
             if let watchSettings = LoopSettingsUserInfo(rawValue: message)?.settings {
-                // So far we only support watch changes of target range overrides
+                // So far we only support watch changes of temporary schedule overrides
                 var settings = deviceManager.loopManager.settings
-                settings.glucoseTargetRangeSchedule = watchSettings.glucoseTargetRangeSchedule
+                settings.scheduleOverride = watchSettings.scheduleOverride
 
                 // Prevent re-sending these updated settings back to the watch
                 lastSentSettings = settings
                 deviceManager.loopManager.settings = settings
             }
-            replyHandler([:])
+
+            // Since target range affects recommended bolus, send back a new one
+            createWatchContext { (context) in
+                replyHandler(context.rawValue)
+            }
         case GlucoseBackfillRequestUserInfo.name?:
             if let userInfo = GlucoseBackfillRequestUserInfo(rawValue: message),
                 let manager = deviceManager.loopManager {
@@ -267,6 +278,8 @@ extension WatchDataManager: WCSessionDelegate {
                 sendWatchContextIfNeeded()
             }
         case .inactive, .notActivated:
+            break
+        @unknown default:
             break
         }
     }
